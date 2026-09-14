@@ -1,0 +1,4 @@
+# Runtime + build dependencies for USB Shortcut Virus Remover
+# Dev/packaging only: pyinstaller is not needed to run the source.
+pyinstaller>=6.0
+Pillow>=10.0
