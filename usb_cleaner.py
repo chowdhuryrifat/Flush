@@ -29,54 +29,11 @@ except ImportError:
 # ──────────────────────────────────────────────
 # Embedded Autorun Resources
 # Everything the app needs to install/uninstall its
-# own "open on USB insert" trigger lives in these
-# constants, so one binary is fully self-contained.
+# own "open on USB insert" trigger lives here, so one
+# binary is fully self-contained.
+# Windows uses a registry Run entry that starts a hidden
+# "watcher" process on logon; Linux uses a udev rule.
 # ──────────────────────────────────────────────
-# Windows: Task Scheduler XML (triggered by Kernel-PnP Event 400,
-# filtered to USB storage so mice/keyboards don't open the app).
-TASK_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Opens the USB Shortcut Virus Remover whenever a USB drive is inserted.</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <EventTrigger>
-      <Enabled>true</Enabled>
-      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-Kernel-PnP/Configuration"&gt;&lt;Select Path="Microsoft-Windows-Kernel-PnP/Configuration"&gt;*[System[Provider[@Name='Microsoft-Windows-Kernel-PnP'] and (EventID=400)]] and *[EventData[Data contains 'USBSTOR']]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-    </EventTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>true</StopOnIdleEnd>
-      <RestartOnIdle>true</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>__EXE_PATH__</Command>
-      <Arguments>--autostart</Arguments>
-    </Exec>
-  </Actions>
-</Task>"""
 
 # Linux: udev rule installed to /etc/udev/rules.d/
 # Matches ANY USB-attached block partition (ID_BUS=usb), regardless of which
@@ -154,8 +111,18 @@ LINUX_RULE_FILE = "/etc/udev/rules.d/99-usb-cleaner-autorun.rules"
 LINUX_WRAPPER_FILE = "/usr/local/bin/usb-cleaner-autostart.sh"
 LINUX_WRAPPER_LINK = "/usr/local/bin/usb-virus-cleaner"
 
-# Windows: managed task name
-WIN_TASK_NAME = "USB Cleaner Autorun"
+# Windows: managed auto-open entry. Auto-open is implemented as a hidden
+# background "watcher" process (auto-started via HKCU Run at logon) that
+# polls for newly inserted removable drives, so the scan window opens the
+# moment a USB stick appears -- the same feel as File Explorer's auto-open.
+# A Task Scheduler EventTrigger was tried first but proved unreliable (the
+# EventTrigger fired for mice/keyboards, and schtasks rejects EventData
+# XPath filters on the Kernel-PnP channel, so USB-only triggering broke).
+WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WIN_RUN_NAME = "Flush USB Cleaner Watcher"
+# Legacy scheduled-task name (previous mechanism); removed on install/uninstall.
+WIN_LEGACY_TASK = "USB Cleaner Autorun"
+WATCH_MUTEX_NAME = "FlushUSBDriveWatcher"
 
 
 # ──────────────────────────────────────────────
@@ -337,23 +304,32 @@ class DriveWatcher:
 # "open on USB insert" trigger from within the app)
 # ──────────────────────────────────────────────
 def app_launch_command():
-    """Return a fully-quoted shell command that launches this app.
+    """Return a shell command that launches this app.
 
-    When frozen (PyInstaller) it's the exe path; otherwise python + script.
+    When frozen (PyInstaller) it's the executable; otherwise python + script.
+    Quoting is platform-aware: Windows uses double quotes (single quotes are
+    literal characters there), POSIX uses shlex.quote so the value can also
+    be embedded in a shell script (Linux udev wrapper).
     """
+
+    def _path(p):
+        return '"{}"'.format(p.replace('"', '')) if " " in p else p
+
     if getattr(sys, "frozen", False):
-        return shlex.quote(sys.executable)
-    return f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+        exe = sys.executable
+        if platform.system() == "Windows":
+            return _path(exe)
+        return shlex.quote(exe)
+    script = os.path.abspath(__file__)
+    if platform.system() == "Windows":
+        return f"{_path(sys.executable)} {_path(script)}"
+    return f"{shlex.quote(sys.executable)} {shlex.quote(script)}"
 
 
 def autorun_status():
     """Return (enabled: bool, detail: str) describing current autorun state."""
     if platform.system() == "Windows":
-        r = subprocess.run(["schtasks", "/Query", "/TN", WIN_TASK_NAME],
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            return True, f"Task '{WIN_TASK_NAME}' is registered"
-        return False, "No autorun task found"
+        return _autorun_status_windows()
     else:
         try:
             exists = os.path.isfile(LINUX_RULE_FILE) and os.path.isfile(LINUX_WRAPPER_FILE)
@@ -369,6 +345,59 @@ def autorun_status():
                 pass
             return True, detail
         return False, "No udev rule installed"
+
+
+def _autorun_status_windows():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0,
+                            winreg.KEY_READ) as k:
+            val, _ = winreg.QueryValueEx(k, WIN_RUN_NAME)
+        if "--watch" in val.lower():
+            return True, "Watcher enabled (starts at logon)"
+        return False, "Auto-open entry found but malformed"
+    except OSError:
+        return False, "No auto-open entry found"
+
+
+def _watch_entry_present():
+    """True if the HKCU Run auto-open entry still points at --watch."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0,
+                            winreg.KEY_READ) as k:
+            val, _ = winreg.QueryValueEx(k, WIN_RUN_NAME)
+        return "--watch" in val.lower()
+    except OSError:
+        return False
+
+
+def _remove_legacy_autorun_task():
+    """Best-effort removal of the old Task Scheduler auto-open task."""
+    try:
+        subprocess.run(["schtasks", "/Delete", "/TN", WIN_LEGACY_TASK, "/F"],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
+def _spawn_watcher():
+    """Launch a detached hidden watcher process (used right after Enable)."""
+    if getattr(sys, "frozen", False):
+        argv = [sys.executable, "--watch"]
+    else:
+        argv = [sys.executable, os.path.abspath(__file__), "--watch"]
+    try:
+        if os.name == "nt":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(argv, creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+                             close_fds=True)
+        else:
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
 
 
 def install_autorun():
@@ -388,62 +417,34 @@ def uninstall_autorun():
 
 
 def _install_autorun_windows():
-    exe = app_launch_command()
-    xml = TASK_XML_TEMPLATE.replace("__EXE_PATH__", exe.replace("\\", "\\\\"))
-    tmp = os.path.join(tempfile.gettempdir(), "usb-cleaner-task.xml")
+    _remove_legacy_autorun_task()
     try:
-        with open(tmp, "w", encoding="utf-16") as f:
-            f.write(xml)
-    except OSError as e:
-        return False, f"Cannot write task file: {e}"
-    cmd = ["schtasks", "/Create", "/TN", WIN_TASK_NAME, "/XML", tmp, "/F"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, WIN_RUN_NAME, 0, winreg.REG_SZ,
+                              f"{app_launch_command()} --watch")
     except Exception as e:
-        return False, f"Failed to run schtasks: {e}"
-    os.remove(tmp)
-    if r.returncode == 0:
-        return True, "Autorun installed. Insert a USB drive to test it."
-    # Common failure: not elevated. Try elevated re-run via PowerShell.
-    try:
-        ps = (
-            "Start-Process -FilePath schtasks -ArgumentList "
-            f"'/Create','/TN','{WIN_TASK_NAME}','/XML','{tmp}','/F' "
-            "-Verb RunAs -Wait"
-        )
-        # Rewrite tmp since we removed it
-        with open(tmp, "w", encoding="utf-16") as f:
-            f.write(xml)
-        r2 = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                            capture_output=True, text=True, timeout=120)
-        os.remove(tmp)
-        if r2.returncode == 0 or "SUCCESS" in r2.stdout.upper() or "成功" in r2.stdout:
-            return True, "Autorun installed via elevated prompt."
-    except Exception as e:
-        pass
-    return False, f"schtasks failed ({r.returncode}):\n{r.stderr.strip()}"
+        return False, f"Failed to write auto-open entry: {e}"
+    _spawn_watcher()
+    return True, ("Auto-open enabled. A hidden watcher is running now -- "
+                  "plug in a USB drive and the scan window will open itself.")
 
 
 def _uninstall_autorun_windows():
-    cmd = ["schtasks", "/Delete", "/TN", WIN_TASK_NAME, "/F"]
+    _remove_legacy_autorun_task()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, WIN_RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            try:
+                winreg.DeleteValue(k, WIN_RUN_NAME)
+            except FileNotFoundError:
+                pass
+        # Running watcher processes notice the missing entry and exit.
+        return True, "Auto-open removed."
     except Exception as e:
-        return False, f"Failed to run schtasks: {e}"
-    if r.returncode == 0:
-        return True, "Autorun removed."
-    try:
-        ps = (
-            "Start-Process -FilePath schtasks -ArgumentList "
-            f"'/Delete','/TN','{WIN_TASK_NAME}','/F' -Verb RunAs -Wait"
-        )
-        r2 = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                            capture_output=True, text=True, timeout=120)
-        if r2.returncode == 0:
-            return True, "Autorun removed via elevated prompt."
-    except Exception:
-        pass
-    return False, f"schtasks failed ({r.returncode}):\n{r.stderr.strip()}"
+        return False, f"Failed to remove auto-open entry: {e}"
 
 
 def _install_autorun_linux():
@@ -793,6 +794,7 @@ class USBCleanerApp:
         self.scan_thread = None
         self.clean_thread = None
         self._prompted_paths = set()
+        self.watch_mode = False
 
         self._build_ui()
 
@@ -1058,6 +1060,15 @@ class USBCleanerApp:
             if path in self._prompted_paths:
                 return
             self._prompted_paths.add(path)
+            if self.watch_mode:
+                # Background watcher: bring the (hidden) window up front.
+                try:
+                    self.root.deiconify()
+                    self.root.lift()
+                    self.root.attributes("-topmost", True)
+                    self.root.attributes("-topmost", False)
+                except Exception:
+                    pass
             answer = messagebox.askyesno(
                 "New USB Drive Detected",
                 f"USB drive detected:\n\n   {label} ({path})\n\n"
@@ -1078,17 +1089,36 @@ class USBCleanerApp:
 
         self.root.after(0, _handle)
 
-    def offer_first_removable(self):
-        """Used on Windows autostart: offer to scan whichever removable
-        drive is connected (the task trigger can't pass a drive letter)."""
+    def offer_first_removable(self, root=None, polls=20, interval=500):
+        """Used on OS-driven auto-open launches (Linux --autostart): wait
+        for a removable drive to appear, then offer to scan it.
+
+        The scheduled task fires on ANY device-start event (mice,
+        keyboards, hubs, storage), because Task Scheduler rejects EventData
+        XPath filters on the Kernel-PnP channel. So if no removable drive
+        shows up within the poll window, this exits silently instead of
+        showing a useless window.
+        """
         try:
             drives = get_removable_drives()
         except Exception:
             drives = []
-        if not drives:
-            self.status_var.set("Auto-launched: no removable drive detected yet.")
+        if drives:
+            if root is not None:
+                root.deiconify()
+            self.refresh_drives()
+            self.select_drive_and_prompt(drives[0]["path"])
             return
-        self.select_drive_and_prompt(drives[0]["path"])
+        if polls <= 0:
+            try:
+                if hasattr(self, "watcher"):
+                    self.watcher.stop()
+                if root is not None:
+                    root.destroy()
+            except Exception:
+                pass
+            return
+        self.root.after(interval, lambda: self.offer_first_removable(root, polls - 1, interval))
 
     def select_drive_and_prompt_with_retry(self, device_or_path, attempts=12):
         """Resolve a device/path to a mounted dir and prompt to scan it.
@@ -1109,8 +1139,8 @@ class USBCleanerApp:
     def select_drive_and_prompt(self, path):
         """Select a drive path in the dropdown and ask the user to scan it.
 
-        Used when the app is launched by an OS autorun trigger (udev /
-        Task Scheduler) right after a USB drive is inserted.
+        Used when the app is launched by an OS auto-open trigger (udev /
+        background watcher) right after a USB drive is inserted.
         """
         if not os.path.isdir(path):
             return
@@ -1308,7 +1338,10 @@ def main():
     # CLI usage:
     #   app /path/to/drive   -> resolve + immediately prompt scan
     #   app /dev/sdb1        -> resolve mount path then prompt
-    #   app --autostart      -> (Windows task) open & offer any connected drive
+    #   app --autostart      -> (Linux udev) open & offer any connected drive
+    #   app --watch          -> (Windows) hidden background watcher; opens
+    #                           the window when a new USB drive appears
+    flag_watch = "--watch" in args
     autostart_path = None
     flag_autostart = False
     for a in args:
@@ -1324,7 +1357,37 @@ def main():
     # Set window icon (creeper USB stick) if present next to the script/exe
     _set_window_icon(root)
 
+    if flag_watch:
+        # Only one watcher process may run at a time.
+        mutex = None
+        try:
+            import ctypes
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, WATCH_MUTEX_NAME)
+            if not mutex or ctypes.windll.kernel32.GetLastError() == 183:
+                root.destroy()
+                return
+        except Exception:
+            pass
+        app._watch_mutex = mutex
+        app.watch_mode = True
+        root.withdraw()
+
+        def _watch_self_terminate():
+            # If auto-open was disabled (Run entry removed), stop quietly.
+            if not _watch_entry_present():
+                if hasattr(app, "watcher"):
+                    app.watcher.stop()
+                root.destroy()
+                return
+            root.after(15000, _watch_self_terminate)
+
+        root.after(15000, _watch_self_terminate)
+
     def _on_close():
+        if app.watch_mode:
+            # Closing the watcher window hides it but keeps watching.
+            root.withdraw()
+            return
         if hasattr(app, "watcher"):
             app.watcher.stop()
         root.destroy()
@@ -1334,7 +1397,11 @@ def main():
     if autostart_path:
         root.after(300, lambda: app.select_drive_and_prompt_with_retry(autostart_path))
     elif flag_autostart:
-        root.after(400, lambda: app.offer_first_removable())
+        # Keep the window hidden until we actually find a removable drive;
+        # if none appears (task fired for a mouse/keyboard/hub event) exit
+        # silently so the user isn't bothered on every device insert.
+        root.withdraw()
+        root.after(400, lambda: app.offer_first_removable(root))
 
     root.mainloop()
 
